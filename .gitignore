@@ -1,0 +1,7 @@
+# Logs
+tray_debug.txt
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

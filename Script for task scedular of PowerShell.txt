@@ -1,0 +1,61 @@
+# --- YOUR SPECIFIC CONFIGURATION PATH ---
+$InstallDir = "C:\Users\joshi\OneDrive - Monarch Innovation Private Limited\Documents\Anitgravity\LG TV"
+if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force }
+
+# Both filenames are now matched exactly to "LG TV Toggle"
+$PsScriptPath = "$InstallDir\LG TV Toggle.ps1"
+$VbsScriptPath = "$InstallDir\LG TV Toggle.vbs"
+$LgtvPath = "C:\Program Files\LGTV Companion\LGTV Companion.exe"
+
+# --- 1. WRITE THE CORE TOGGLE LOGIC ---
+$PsCode = @"
+`$LgtvPath = "$LgtvPath"
+`$StateFile = "`$env:TEMP\lgtv_state.txt"
+
+if (-not (Test-Path `$StateFile)) { Set-Content -Path `$StateFile -Value "1" }
+`$CurrentState = Get-Content -Path `$StateFile
+`$wsh = New-Object -ComObject WScript.Shell
+
+if (`$CurrentState -eq "1") {
+    if (-not [console]::ScrollLock) { `$wsh.SendKeys("{SCROLLLOCK}"); Start-Sleep -Milliseconds 200 }
+    Start-Process `$LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
+    Set-Content -Path `$StateFile -Value "2"
+} else {
+    Start-Process `$LgtvPath -ArgumentList "-sethdmi1" -WindowStyle Hidden
+    Set-Content -Path `$StateFile -Value "1"
+    Start-Sleep -Seconds 1
+    if ([console]::ScrollLock) { `$wsh.SendKeys("{SCROLLLOCK}") }
+}
+"@
+Set-Content -Path $PsScriptPath -Value $PsCode -Force
+
+# --- 2. WRITE THE INVISIBLE VBS LAUNCHER ---
+$VbsCode = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File ""$PsScriptPath""", 0, False
+"@
+Set-Content -Path $VbsScriptPath -Value $VbsCode -Force
+
+# --- 3. AUTOMATE WINDOWS + L TASK SCHEDULER SETUP ---
+$TaskName = "LGTV_Switch_On_Lock"
+
+# Action 1: Force TV back to Windows (HDMI 1)
+$Action1 = New-ScheduledTaskAction -Execute $LgtvPath -Argument "-sethdmi1"
+
+# Action 2: Reset tracking state cache back to 1 (Windows)
+$Action2 = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c echo 1 > %TEMP%\lgtv_state.txt"
+
+# Trigger on Workstation Lock
+$Trigger = New-ScheduledTaskTrigger -OnLock
+
+# Principal setting to execute cleanly with Admin permissions
+$Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+# Package and register the automated task
+$Task = New-ScheduledTask -Action $Action1, $Action2 -Trigger $Trigger -Principal $Principal
+Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force
+
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Green
+Write-Host "  SUCCESS! Both files named 'LG TV Toggle'   " -ForegroundColor Green
+Write-Host "=============================================" -ForegroundColor Green
