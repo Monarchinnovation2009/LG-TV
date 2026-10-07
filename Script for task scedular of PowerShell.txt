@@ -1,61 +1,46 @@
+# One-off setup / cleanup script. Not invoked at runtime.
+#
+# Lock (Win+L) handling now lives ONLY in "LG TV TrayApp.ps1", which switches
+# the TV to HDMI1 via its SessionSwitch handler. The scheduled task this script
+# used to register did the opposite (-sethdmi1 as SYSTEM, with no reachability
+# check) and would fight the tray app on every lock, so it is no longer created
+# and any previously registered copy is removed below.
+#
+# This script also no longer embeds its own copy of the toggle logic. That was a
+# third duplicate that silently overwrote "LG TV Toggle.ps1"; the canonical
+# version is that file itself.
+
 # --- YOUR SPECIFIC CONFIGURATION PATH ---
 $InstallDir = "C:\Users\joshi\OneDrive - Monarch Innovation Private Limited\Documents\Anitgravity\LG TV"
-if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force }
+if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
 
-# Both filenames are now matched exactly to "LG TV Toggle"
 $PsScriptPath = "$InstallDir\LG TV Toggle.ps1"
 $VbsScriptPath = "$InstallDir\LG TV Toggle.vbs"
-$LgtvPath = "C:\Program Files\LGTV Companion\LGTV Companion.exe"
 
-# --- 1. WRITE THE CORE TOGGLE LOGIC ---
-$PsCode = @"
-`$LgtvPath = "$LgtvPath"
-`$StateFile = "`$env:TEMP\lgtv_state.txt"
-
-if (-not (Test-Path `$StateFile)) { Set-Content -Path `$StateFile -Value "1" }
-`$CurrentState = Get-Content -Path `$StateFile
-`$wsh = New-Object -ComObject WScript.Shell
-
-if (`$CurrentState -eq "1") {
-    if (-not [console]::ScrollLock) { `$wsh.SendKeys("{SCROLLLOCK}"); Start-Sleep -Milliseconds 200 }
-    Start-Process `$LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
-    Set-Content -Path `$StateFile -Value "2"
-} else {
-    Start-Process `$LgtvPath -ArgumentList "-sethdmi1" -WindowStyle Hidden
-    Set-Content -Path `$StateFile -Value "1"
-    Start-Sleep -Seconds 1
-    if ([console]::ScrollLock) { `$wsh.SendKeys("{SCROLLLOCK}") }
+# --- 1. SANITY-CHECK THE TOGGLE SCRIPT ---
+if (-not (Test-Path $PsScriptPath)) {
+    Write-Warning "Missing $PsScriptPath - restore it from the repo before continuing."
+    return
 }
-"@
-Set-Content -Path $PsScriptPath -Value $PsCode -Force
 
-# --- 2. WRITE THE INVISIBLE VBS LAUNCHER ---
+# --- 2. (RE)WRITE THE INVISIBLE VBS LAUNCHER ---
+# Purely derived from the path above, so it is safe to regenerate.
 $VbsCode = @"
 Set WshShell = CreateObject("WScript.Shell")
 WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File ""$PsScriptPath""", 0, False
 "@
 Set-Content -Path $VbsScriptPath -Value $VbsCode -Force
 
-# --- 3. AUTOMATE WINDOWS + L TASK SCHEDULER SETUP ---
+# --- 3. REMOVE THE OBSOLETE ON-LOCK TASK ---
 $TaskName = "LGTV_Switch_On_Lock"
-
-# Action 1: Force TV back to Windows (HDMI 1)
-$Action1 = New-ScheduledTaskAction -Execute $LgtvPath -Argument "-sethdmi1"
-
-# Action 2: Reset tracking state cache back to 1 (Windows)
-$Action2 = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c echo 1 > %TEMP%\lgtv_state.txt"
-
-# Trigger on Workstation Lock
-$Trigger = New-ScheduledTaskTrigger -OnLock
-
-# Principal setting to execute cleanly with Admin permissions
-$Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-# Package and register the automated task
-$Task = New-ScheduledTask -Action $Action1, $Action2 -Trigger $Trigger -Principal $Principal
-Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Write-Host "Removed obsolete scheduled task '$TaskName'." -ForegroundColor Yellow
+} else {
+    Write-Host "No '$TaskName' task registered - nothing to remove." -ForegroundColor DarkGray
+}
 
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Green
-Write-Host "  SUCCESS! Both files named 'LG TV Toggle'   " -ForegroundColor Green
+Write-Host "  Done. Lock handling is owned by the tray app" -ForegroundColor Green
 Write-Host "=============================================" -ForegroundColor Green
