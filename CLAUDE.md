@@ -4,36 +4,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small set of Windows PowerShell/VBS scripts that automate switching an LG TV (used as a monitor) between two HDMI inputs — HDMI 1 (this Windows PC) and HDMI 2 (a Mac connected to the same TV) — by driving the third-party [LGTV Companion](https://github.com/JPersson77/LGTVCompanion) CLI (`LGTV Companion.exe`). This is not a buildable/testable software project — there is no package manager, build step, or test suite. It's a handful of standalone scripts run directly by Windows (via Task Scheduler, a tray icon, or a VBS launcher).
+A small set of Windows PowerShell/VBS scripts that automate switching an LG TV (used as a monitor) between two HDMI inputs — **HDMI 1 (a Mac)** and **HDMI 2 (this Windows PC)** — by driving the third-party [LGTV Companion](https://github.com/JPersson77/LGTVCompanion) CLI. There is no package manager, build step, or test suite; the scripts are run directly by Windows (tray icon autostart or a VBS launcher).
 
-Not currently a git repository.
+Git repo, remote `origin` = `git@github.com:Monarchinnovation2009/LG-TV.git`, branch `master`.
 
-## Running / iterating on the scripts
+## Running / iterating
 
-- Run a script directly to test a change: `powershell.exe -ExecutionPolicy Bypass -File "LG TV TrayApp.ps1"` (add `-WindowStyle Hidden` only when you don't need to see errors/output).
-- The VBS files (`launch_tray_app.vbs`, `launch_toggle.vbs`, `LG TV Toggle.vbs`) are silent launchers — they just shell out to the corresponding `.ps1` with `-WindowStyle Hidden` so no console window flashes. Edit the `.ps1`, not the `.vbs`, when changing behavior.
-- `Script for task scedular of PowerShell.txt` is a one-off setup script (not itself invoked at runtime) that generates `LG TV Toggle.ps1` / `LG TV Toggle.vbs` from an embedded here-string and registers a Task Scheduler task (`LGTV_Switch_On_Lock`, trigger: `OnLock`, runs as SYSTEM). If you edit the toggle logic, keep this generator script's embedded copy in sync or it will overwrite your changes next time it's run.
-- State persists across script runs in `$env:TEMP\lgtv_state.txt` (`"1"` = HDMI1/PC, `"2"` = HDMI2/Mac). Delete this file to reset state during testing.
+- Run with visible errors: `powershell.exe -ExecutionPolicy Bypass -File "LG TV TrayApp.ps1"`.
+- The tray app is single-instance (named mutex `Local\LGTVTrayApp_SingleInstance`); a second launch exits silently. To pick up code changes, Exit the running instance from the tray menu (or kill it) and relaunch via `launch_tray_app.vbs`.
+- When killing it from a script, do NOT match on the literal string `TrayApp` in a command that itself contains that string — the filter matches your own shell and kills it. Build the pattern dynamically (`'Tray' + 'App'`).
+- Autostart: `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\LGTVTrayApp` → `wscript.exe "...\launch_tray_app.vbs"`, toggled by Settings → "Start with Windows".
+- The VBS files are silent launchers for the matching `.ps1`. Edit the `.ps1`, not the `.vbs`.
+- `Script for task scedular of PowerShell.txt` is a one-off setup/cleanup script: it regenerates `LG TV Toggle.vbs` and **unregisters** the obsolete `LGTV_Switch_On_Lock` task. It no longer registers a task or embeds toggle logic.
+- `tray_debug.txt` (gitignored) is a decision log: every switch request, which gate refused it, and session/cable events. Read it first when a behaviour report comes in.
+- State file `$env:TEMP\lgtv_state.txt`: `"1"` = HDMI1 (Mac), `"2"` = HDMI2 (PC). It is a cache, not truth — the TV's real input is `LGTVcli.exe -request com.webos.applicationManager/getForegroundAppInfo`.
 
 ## Architecture
 
-There are **two independent implementations** of the same HDMI-toggle idea — know which one you're editing:
+1. **`LG TV TrayApp.ps1`** — the primary app. A persistent `NotifyIcon` running `[System.Windows.Forms.Application]::Run()`, with a global hotkey (Ctrl+Alt+P, embedded C# `HotkeyManager`), tray menu, and Settings submenu (rename HDMI labels, "Only switch when TV cable is connected", "Start with Windows"). Config in `$env:APPDATA\LGTVTrayApp\config.json`: `Hdmi1Label` (default "Mac"), `Hdmi2Label` (default "PC"), `RequireCable` (default `true`).
+2. **`LG TV Toggle.ps1`** — a one-shot toggle for external invocation. Has the reachability guard but no cable/input checks and no knowledge of the tray config.
 
-1. **`LG TV TrayApp.ps1`** — the primary, actively developed app. Runs persistently as a system-tray icon (`NotifyIcon` + `ContextMenuStrip`) via `[System.Windows.Forms.Application]::Run()`. Provides:
-   - A global hotkey (Ctrl+Alt+P) registered through an embedded C# `HotkeyManager` class (P/Invoke `RegisterHotKey`/`WndProc`).
-   - Tray menu items to toggle or jump directly to HDMI1/HDMI2, with the active input reflected live in the tray tooltip and a checkmark on the corresponding menu item (`Update-TrayStatus`, called after every state-changing action).
-   - A **Settings** submenu to rename what HDMI1/HDMI2 are called (`Set-HdmiLabel`, via a `Microsoft.VisualBasic.Interaction]::InputBox` prompt) and a "Start with Windows" checkable item that writes/removes a `HKCU:\...\Run` registry value pointing at `launch_tray_app.vbs` (`Test-StartupEnabled`/`Set-StartupEnabled`).
-   - HDMI labels persist to `$env:APPDATA\LGTVTrayApp\config.json` (`Get-Config`/`Save-Config`) — defaults are `Hdmi1Label = "Mac"`, `Hdmi2Label = "PC"`.
-   - A `Microsoft.Win32.SystemEvents.SessionSwitch` handler that forces HDMI2 (PC) whenever the session locks (Win+L).
-2. **`LG TV Toggle.ps1`** (+ its `.vbs` launcher) — a simpler, one-shot script meant to be invoked externally (e.g. by the Task Scheduler `OnLock` task), not run persistently. It has no knowledge of the tray app's HDMI labels/config — it only flips Scroll Lock and calls the LGTV Companion CLI.
+### Switch gates (`Switch-ToHDMI1` / `Switch-ToHDMI2`), cheapest first
 
-Both read/write the same `$env:TEMP\lgtv_state.txt` state file, so they interoperate, but toggle logic is duplicated between them (and a third copy lives inside `Script for task scedular of PowerShell.txt`'s generator). A behavior fix usually needs to be applied in more than one place.
+1. `Test-SwitchAllowed` — if `RequireCable`, requires `Test-TVCableConnected` (an active LG/GSM monitor in WMI `WmiMonitorID`; EDID fields can be null, so decode via `Convert-EdidString`).
+2. `Test-TVConnected` — raw `System.Net.NetworkInformation.Ping` (400 ms × 2) to the TV IP read from `C:\ProgramData\LGTV Companion\config.json`. Never use `Test-Connection` here: it blocks the UI thread ~9 s when the TV is off.
+3. `Test-HdmiInputAvailable` — `LGTVcli.exe -request tv/getExternalInputList` (no `ssap://` prefix). Keys on `connected` only; `hdmiPlugIn` was measured to stay `true` with the cable out. Fails open on query error.
 
-### Scroll Lock as a state signal
+Scroll Lock is set only after a command is sent (OFF = HDMI1, ON = HDMI2).
 
-Scroll Lock's on/off state is deliberately kept in sync with the active HDMI input — OFF while HDMI1 (Mac) is active, ON while HDMI2 (PC) is active — for at-a-glance keyboard-LED feedback of the current input. This sync is implemented differently in each script:
+### Automatic triggers
 
-- `LG TV TrayApp.ps1` uses P/Invoke `keybd_event` (`HotkeyManager.ToggleScrollLock()`) and checks state via `[System.Windows.Forms.Control]::IsKeyLocked(...)`. It only toggles when the current lock state doesn't already match the target, and additionally force-releases Ctrl/Alt before toggling (workaround for the hotkey's own modifier keys still being "held" during the callback).
-- `LG TV Toggle.ps1` (and the generator's embedded copy) instead uses `WScript.Shell.SendKeys("{SCROLLLOCK}")` and checks `[console]::ScrollLock`.
+- **Lock** → `Hide-TVContent` (force HDMI2 so the Mac isn't left visible), only when `Test-SwitchAllowed`.
+- **Cable disconnect** (`DisplaySettingsChanged`, acting only on a connected→disconnected transition) → `Hide-TVContent`.
+- **Unlock** and **startup** → `Switch-ToHDMI2 -Silent` (normal gates).
+- `Hide-TVContent` deliberately bypasses the cable and input gates (a dead input is the goal); it still requires reachability.
 
-`Switch-ToHDMI1`/`Switch-ToHDMI2` set Scroll Lock *before* confirming the TV is actually connected (`Test-TVConnected`, which checks for a second screen or an LG/GSM-manufacturer monitor via WMI `WmiMonitorID`), so the lock-key state can drift out of sync with the real HDMI input if the TV isn't reachable — check both the toggle order and the connectivity guard when debugging state-mismatch reports.
+LGTV Companion's own `SetHdmiInput` is set to `false` in its config, because it switched to HDMI2 on resume with no cable check; the tray app replaces it.
