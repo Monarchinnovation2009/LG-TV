@@ -43,9 +43,10 @@ The PC is the Deskflow server (layout: PC left, Mac mini right). Deskflow treats
 
 ### Automatic triggers
 
-- **Lock** → `Switch-ToHDMI1` (hand the TV to the Mac, Scroll Lock OFF), falling back to `Hide-TVContent` if refused. Only when `Test-SwitchAllowed`. Locking the PC means moving to the Mac via Deskflow; hiding on lock trapped the cursor on the locked PC.
+- **Lock** → `Hide-TVScreen`: `Hide-TVContent` (HDMI2, cursor locked to PC) then LGTVcli `-screenOff`, so nothing at all shows — HDMI2 alone still shows the Windows lock screen. Only when `Test-SwitchAllowed`. Sets `$script:ScreenBlanked`.
 - **Cable disconnect** (`DisplaySettingsChanged`, acting only on a connected→disconnected transition) → `Hide-TVContent`.
-- **Unlock** and **startup** → `Switch-ToHDMI2 -Silent` (normal gates); if refused, `Sync-ScrollLockFromTV`.
+- **Unlock** and **startup** → `Show-TVScreen -CheckTV` (`-screenOn` if we blanked it or the TV reports `Screen Off`, regardless of the cable gate), then `Switch-ToHDMI2 -Silent`; if refused, `Sync-ScrollLockFromTV`. Manual switches also call `Show-TVScreen`.
+- TV power state: `LGTVcli -request com.webos.service.tvpower/power/getPowerState` → `Active` / `Screen Off`.
 - `Hide-TVContent` deliberately bypasses the cable and input gates (a dead input is the goal); it still requires reachability.
 
 LGTV Companion's own `SetHdmiInput` is set to `false` in its config, because it switched to HDMI2 on resume with no cable check; the tray app replaces it.

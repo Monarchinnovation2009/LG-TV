@@ -148,6 +148,8 @@ $script:Config = Get-Config
 # Pending Scroll Lock change, retried by $scrollLockTimer (see Set-ScrollLock).
 $script:ScrollLockTarget = $null
 $script:ScrollLockRetries = 0
+# Set while Hide-TVScreen has the TV panel blanked.
+$script:ScreenBlanked = $false
 
 function Set-HdmiLabel($HdmiNumber) {
     Add-Type -AssemblyName Microsoft.VisualBasic
@@ -244,10 +246,14 @@ function Get-TVInputList { return (Invoke-TVRequest "tv/getExternalInputList") }
 
 # Sends one LGTVcli request and returns the parsed JSON, or $null on failure or
 # timeout.
-function Invoke-TVRequest($Endpoint) {
+function Invoke-TVRequest($Endpoint) { return (Invoke-TVCli @("-request", $Endpoint)) }
+
+# Runs LGTVcli with the given arguments and returns its parsed JSON output, or
+# $null on failure or timeout.
+function Invoke-TVCli([string[]]$Arguments) {
     $out = [System.IO.Path]::GetTempFileName()
     try {
-        $proc = Start-Process -FilePath $CliPath -ArgumentList "-request", $Endpoint `
+        $proc = Start-Process -FilePath $CliPath -ArgumentList $Arguments `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput $out
         if (-not $proc.WaitForExit($CliTimeoutMs)) {
             try { $proc.Kill() } catch {}
@@ -404,6 +410,7 @@ function Switch-ToHDMI1([switch]$Silent) {
         Update-TrayStatus
         return $false
     }
+    Show-TVScreen
     Write-TrayLog "  sending -sethdmi1"
     Start-Process $LgtvPath -ArgumentList "-sethdmi1" -WindowStyle Hidden
     Set-TVState "1"
@@ -433,6 +440,7 @@ function Switch-ToHDMI2([switch]$Silent) {
         Update-TrayStatus
         return $false
     }
+    Show-TVScreen
     Write-TrayLog "  sending -sethdmi2"
     Start-Process $LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
     Set-TVState "2"
@@ -461,6 +469,44 @@ function Hide-TVContent {
     Set-TVState "2"
     Set-ScrollLock $true
     Update-TrayStatus
+}
+
+# Lock: nothing at all on the TV. Switching to HDMI2 alone still shows the
+# Windows lock screen, so park the TV on this PC's input (so nothing of the Mac
+# appears if someone wakes the panel with the remote), then blank the panel.
+# Cursor stays locked to the PC (Hide-TVContent): with the TV dark, the Mac is
+# not visible anywhere.
+function Hide-TVScreen {
+    Write-TrayLog "Hide-TVScreen (lock) - HDMI2 then screen off"
+    if (-not (Test-TVConnected)) {
+        Write-TrayLog "  refused: TV not reachable on the network"
+        return
+    }
+    Hide-TVContent
+    # Give the input switch a moment so it does not wake the panel again.
+    Start-Sleep -Milliseconds 1500
+    $state = Get-TVPowerState (Invoke-TVCli @("-screenOff"))
+    $script:ScreenBlanked = $true
+    Write-TrayLog "  screen off sent, TV reports '$state'"
+}
+
+# Undoes Hide-TVScreen. Also checks the TV itself when -CheckTV is given, so a
+# panel blanked before this instance started (app restarted while locked) is
+# restored too.
+function Show-TVScreen([switch]$CheckTV) {
+    if (-not $script:ScreenBlanked -and -not $CheckTV) { return }
+    if (-not (Test-TVConnected)) { return }
+    if (-not $script:ScreenBlanked) {
+        if ((Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")) -ne "Screen Off") { return }
+    }
+    $state = Get-TVPowerState (Invoke-TVCli @("-screenOn"))
+    $script:ScreenBlanked = $false
+    Write-TrayLog "  screen on sent, TV reports '$state'"
+}
+
+function Get-TVPowerState($Json) {
+    if (-not $Json) { return $null }
+    foreach ($device in $Json.PSObject.Properties) { return $device.Value.payload.state }
 }
 
 function Switch-TVState {
@@ -600,21 +646,21 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
     param($sender, $e)
     # The cable policy is enforced inside Switch-ToHDMI1/2, so these just ask.
     if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
-        # Locking this PC means moving over to the Mac via Deskflow: hand the TV
-        # to the Mac and release the cursor (Scroll Lock OFF). Hiding on lock
-        # left Scroll Lock ON and trapped the cursor on the locked PC.
+        # Locking: nothing should show on the TV - not the Mac, not the lock
+        # screen. Blank the panel (see Hide-TVScreen).
         Write-TrayLog "event: session locked"
         # Only when this PC is actually on the TV (honours RequireCable).
         # Uncabled, the TV is showing something else and is not ours to touch.
         if (Test-SwitchAllowed) {
-            # Mac off or unplugged: fall back to hiding rather than leaving the
-            # locked PC's input up.
-            if (-not (Switch-ToHDMI1 -Silent)) { Hide-TVContent }
+            Hide-TVScreen
         } else {
             Write-TrayLog "  skipped: this PC is not cabled to the TV"
         }
     } elseif ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionUnlock) {
         Write-TrayLog "event: session unlocked"
+        # Light the panel first, regardless of the cable gate: if we blanked it,
+        # we must not leave it dark.
+        Show-TVScreen -CheckTV
         # Coming back - take the TV to this PC. This replaces LGTV Companion's
         # own unconditional SetHdmiInput-on-resume, which had no cable check.
         # If no switch was sent, Scroll Lock may still hold whatever the lock
@@ -647,6 +693,7 @@ $displaySettingsHandler = [EventHandler]{
 # check. Cable-gated: if this PC is not plugged into the TV, leave the TV alone.
 # Remove this line if you would rather nothing switched at startup.
 Write-TrayLog "--- tray app started (pid $PID) ---"
+Show-TVScreen -CheckTV
 if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
 
 # Retries a pending cursor-lock change (see Set-ScrollLock) every 1.5 s for up
