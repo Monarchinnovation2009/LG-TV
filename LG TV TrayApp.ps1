@@ -142,6 +142,9 @@ function Save-Config($Config) {
 }
 
 $script:Config = Get-Config
+# Pending Scroll Lock change, retried by $scrollLockTimer (see Set-ScrollLock).
+$script:ScrollLockTarget = $null
+$script:ScrollLockRetries = 0
 
 function Set-HdmiLabel($HdmiNumber) {
     Add-Type -AssemblyName Microsoft.VisualBasic
@@ -234,10 +237,14 @@ function Test-TVConnected {
 
 # Asks the TV what is plugged into each of its inputs. Returns $null if the
 # query could not be completed. Endpoint takes no "ssap://" prefix.
-function Get-TVInputList {
+function Get-TVInputList { return (Invoke-TVRequest "tv/getExternalInputList") }
+
+# Sends one LGTVcli request and returns the parsed JSON, or $null on failure or
+# timeout.
+function Invoke-TVRequest($Endpoint) {
     $out = [System.IO.Path]::GetTempFileName()
     try {
-        $proc = Start-Process -FilePath $CliPath -ArgumentList "-request", "tv/getExternalInputList" `
+        $proc = Start-Process -FilePath $CliPath -ArgumentList "-request", $Endpoint `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput $out
         if (-not $proc.WaitForExit($CliTimeoutMs)) {
             try { $proc.Kill() } catch {}
@@ -273,13 +280,45 @@ function Test-HdmiInputAvailable([int]$Number) {
     return $true
 }
 
-# Drives Scroll Lock to a target state (OFF = HDMI1, ON = HDMI2) rather than
-# blind-toggling, so a drifted LED self-corrects.
+# Scroll Lock drives Deskflow's "lock cursor to current screen":
+#   ON  while the TV shows this PC (HDMI2) - the cursor must not slide onto the
+#       Mac, which is not visible, taking keyboard input with it.
+#   OFF while the TV shows the Mac (HDMI1) - the cursor has to cross over.
+# Drives to a target state rather than blind-toggling. Windows drops injected
+# keys while the lock screen is up, so a change that does not take is left
+# pending and retried by $scrollLockTimer.
 function Set-ScrollLock([bool]$On) {
+    $script:ScrollLockTarget = $On
+    $script:ScrollLockRetries = 0
     if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -ne $On) {
         [HotkeyManager]::ToggleScrollLock()
         Start-Sleep -Milliseconds 200
     }
+    if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -eq $On) {
+        $script:ScrollLockTarget = $null
+    } else {
+        Write-TrayLog "  Scroll Lock change to $(if ($On) { 'ON' } else { 'OFF' }) did not take - retrying"
+    }
+}
+
+# Sets Scroll Lock from what the TV is actually showing, for when no switch was
+# sent. OFF only when the TV is confirmed on the Mac; an unreachable TV means the
+# Mac is not visible either, so ON. Falls back to the state file if the query
+# itself fails.
+function Sync-ScrollLockFromTV {
+    $onMac = $false
+    if (Test-TVConnected) {
+        $resp = Invoke-TVRequest "com.webos.applicationManager/getForegroundAppInfo"
+        if ($resp) {
+            $appId = foreach ($device in $resp.PSObject.Properties) { $device.Value.payload.appId }
+            $onMac = ("$appId" -eq "com.webos.app.hdmi1")
+        } else {
+            $onMac = ((Get-TVState) -eq "1")
+        }
+    }
+    Write-TrayLog "  Scroll Lock sync: TV showing Mac = $onMac"
+    Set-ScrollLock (-not $onMac)
+    Update-TrayStatus
 }
 
 function Show-TVUnreachable {
@@ -312,19 +351,19 @@ function Switch-ToHDMI1([switch]$Silent) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
         Update-TrayStatus
-        return
+        return $false
     }
     if (-not (Test-TVConnected)) {
         Write-TrayLog "  refused: TV not reachable on the network"
         if (-not $Silent) { Show-TVUnreachable }
         Update-TrayStatus
-        return
+        return $false
     }
     if (-not (Test-HdmiInputAvailable 1)) {
         Write-TrayLog "  refused: TV reports nothing plugged into HDMI1"
         if (-not $Silent) { Show-InputEmpty $script:Config.Hdmi1Label 1 }
         Update-TrayStatus
-        return
+        return $false
     }
     Write-TrayLog "  sending -sethdmi1"
     Start-Process $LgtvPath -ArgumentList "-sethdmi1" -WindowStyle Hidden
@@ -332,6 +371,7 @@ function Switch-ToHDMI1([switch]$Silent) {
     Start-Sleep -Seconds 1
     Set-ScrollLock $false
     Update-TrayStatus
+    return $true
 }
 
 function Switch-ToHDMI2([switch]$Silent) {
@@ -340,25 +380,26 @@ function Switch-ToHDMI2([switch]$Silent) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
         Update-TrayStatus
-        return
+        return $false
     }
     if (-not (Test-TVConnected)) {
         Write-TrayLog "  refused: TV not reachable on the network"
         if (-not $Silent) { Show-TVUnreachable }
         Update-TrayStatus
-        return
+        return $false
     }
     if (-not (Test-HdmiInputAvailable 2)) {
         Write-TrayLog "  refused: TV reports nothing plugged into HDMI2"
         if (-not $Silent) { Show-InputEmpty $script:Config.Hdmi2Label 2 }
         Update-TrayStatus
-        return
+        return $false
     }
     Write-TrayLog "  sending -sethdmi2"
     Start-Process $LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
     Set-TVState "2"
     Set-ScrollLock $true
     Update-TrayStatus
+    return $true
 }
 
 # Privacy action for lock / cable-disconnect: point the TV at this PC's input so
@@ -517,15 +558,16 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
     param($sender, $e)
     # The cable policy is enforced inside Switch-ToHDMI1/2, so these just ask.
     if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
-        # Locking should leave nothing of the other input on screen, so this
-        # hides rather than handing the TV to HDMI1.
+        # Locking this PC means moving over to the Mac via Deskflow: hand the TV
+        # to the Mac and release the cursor (Scroll Lock OFF). Hiding on lock
+        # left Scroll Lock ON and trapped the cursor on the locked PC.
         Write-TrayLog "event: session locked"
-        # Only hide when this PC is actually on the TV (honours the RequireCable
-        # setting). Uncabled, the TV is showing something else entirely and is
-        # not ours to touch. Cable-disconnect has its own handler and needs no
-        # check - it only fires on a connected -> disconnected transition.
+        # Only when this PC is actually on the TV (honours RequireCable).
+        # Uncabled, the TV is showing something else and is not ours to touch.
         if (Test-SwitchAllowed) {
-            Hide-TVContent
+            # Mac off or unplugged: fall back to hiding rather than leaving the
+            # locked PC's input up.
+            if (-not (Switch-ToHDMI1 -Silent)) { Hide-TVContent }
         } else {
             Write-TrayLog "  skipped: this PC is not cabled to the TV"
         }
@@ -533,7 +575,9 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
         Write-TrayLog "event: session unlocked"
         # Coming back - take the TV to this PC. This replaces LGTV Companion's
         # own unconditional SetHdmiInput-on-resume, which had no cable check.
-        Switch-ToHDMI2 -Silent
+        # If no switch was sent, Scroll Lock may still hold whatever the lock
+        # screen left it at, so re-derive it from the TV.
+        if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
     }
 }
 [Microsoft.Win32.SystemEvents]::add_SessionSwitch($sessionSwitchHandler)
@@ -561,7 +605,31 @@ $displaySettingsHandler = [EventHandler]{
 # check. Cable-gated: if this PC is not plugged into the TV, leave the TV alone.
 # Remove this line if you would rather nothing switched at startup.
 Write-TrayLog "--- tray app started (pid $PID) ---"
-Switch-ToHDMI2 -Silent
+if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
+
+# Retries a pending Scroll Lock change (see Set-ScrollLock) every 1.5 s for up
+# to a minute. Bounded so it never fights a manual Scroll Lock press for long;
+# unlock re-syncs anyway.
+$scrollLockTimer = New-Object System.Windows.Forms.Timer
+$scrollLockTimer.Interval = 1500
+$scrollLockTimer.add_Tick({
+    if ($null -eq $script:ScrollLockTarget) { return }
+    $want = if ($script:ScrollLockTarget) { "ON" } else { "OFF" }
+    if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -eq $script:ScrollLockTarget) {
+        Write-TrayLog "  Scroll Lock now $want after $($script:ScrollLockRetries) retries"
+        $script:ScrollLockTarget = $null
+        Update-TrayStatus
+        return
+    }
+    if ($script:ScrollLockRetries -ge 40) {
+        Write-TrayLog "  Scroll Lock still not $want after 40 retries - giving up until next unlock"
+        $script:ScrollLockTarget = $null
+        return
+    }
+    $script:ScrollLockRetries++
+    [HotkeyManager]::ToggleScrollLock()
+})
+$scrollLockTimer.Start()
 
 # Start Application Loop
 [System.Windows.Forms.Application]::Run()

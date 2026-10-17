@@ -30,13 +30,19 @@ Git repo, remote `origin` = `git@github.com:Monarchinnovation2009/LG-TV.git`, br
 2. `Test-TVConnected` — raw `System.Net.NetworkInformation.Ping` (400 ms × 2) to the TV IP read from `C:\ProgramData\LGTV Companion\config.json`. Never use `Test-Connection` here: it blocks the UI thread ~9 s when the TV is off.
 3. `Test-HdmiInputAvailable` — `LGTVcli.exe -request tv/getExternalInputList` (no `ssap://` prefix). Keys on `connected` only; `hdmiPlugIn` was measured to stay `true` with the cable out. Fails open on query error.
 
-Scroll Lock is set only after a command is sent (OFF = HDMI1, ON = HDMI2).
+### Scroll Lock = Deskflow cursor lock
+
+The PC is the Deskflow server (layout: PC left, Mac mini right). Deskflow treats Scroll Lock ON as "lock cursor to current screen". So Scroll Lock must follow what the TV shows: **ON while the TV shows the PC** (otherwise the cursor slides onto the invisible Mac and takes keyboard input with it), **OFF while it shows the Mac** (so the cursor can cross).
+
+- Set only after a command is sent. `Set-ScrollLock` verifies the change; Windows drops injected keys while the lock screen is up, so a failed change stays pending and `$scrollLockTimer` retries it every 1.5 s for up to 60 s.
+- When no switch is sent (unlock/startup refused), `Sync-ScrollLockFromTV` derives it from the TV's real input (`getForegroundAppInfo`): OFF only if confirmed on HDMI1.
+- `Switch-ToHDMI1/2` return `$true` only if a command was sent; keep them free of other pipeline output.
 
 ### Automatic triggers
 
-- **Lock** → `Hide-TVContent` (force HDMI2 so the Mac isn't left visible), only when `Test-SwitchAllowed`.
+- **Lock** → `Switch-ToHDMI1` (hand the TV to the Mac, Scroll Lock OFF), falling back to `Hide-TVContent` if refused. Only when `Test-SwitchAllowed`. Locking the PC means moving to the Mac via Deskflow; hiding on lock trapped the cursor on the locked PC.
 - **Cable disconnect** (`DisplaySettingsChanged`, acting only on a connected→disconnected transition) → `Hide-TVContent`.
-- **Unlock** and **startup** → `Switch-ToHDMI2 -Silent` (normal gates).
+- **Unlock** and **startup** → `Switch-ToHDMI2 -Silent` (normal gates); if refused, `Sync-ScrollLockFromTV`.
 - `Hide-TVContent` deliberately bypasses the cable and input gates (a dead input is the goal); it still requires reachability.
 
 LGTV Companion's own `SetHdmiInput` is set to `false` in its config, because it switched to HDMI2 on resume with no cable check; the tray app replaces it.
