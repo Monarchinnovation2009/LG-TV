@@ -34,7 +34,10 @@ Git repo, remote `origin` = `git@github.com:Monarchinnovation2009/LG-TV.git`, br
 
 The PC is the Deskflow server (layout: PC left, Mac mini right). Deskflow treats Scroll Lock ON as "lock cursor to current screen". So Scroll Lock must follow what the TV shows: **ON while the TV shows the PC** (otherwise the cursor slides onto the invisible Mac and takes keyboard input with it), **OFF while it shows the Mac** (so the cursor can cross).
 
-- Set only after a command is sent. `Set-ScrollLock` verifies the change; Windows drops injected keys while the lock screen is up, so a failed change stays pending and `$scrollLockTimer` retries it every 1.5 s for up to 60 s.
+- **Deskflow's state is read from its log, never from the Scroll Lock light.** Deskflow flips its lock on every Scroll Lock press it sees, independently of the light; one press seen by only one of them (e.g. around the lock screen) left them permanently inverted. `Get-CursorLockState` scans the tail of `C:\ProgramData\Deskflow\deskflow-daemon.log` for `cursor locked/unlocked`, `scroll lock is on` (restart) and `stopped server`; it falls back to the light only if Deskflow isn't running.
+- Set only after a command is sent. `Set-ScrollLock` presses Scroll Lock only if Deskflow is in the wrong state, then verifies against the log; a press Deskflow misses stays pending and `$scrollLockTimer` retries every 1.5 s for up to 30 s.
+- Injected keys only reach Deskflow while the cursor is on the PC: with the cursor on the Mac, Deskflow forwards them to the Mac. Test live only when the last `switch from` log line ends `to "Harsh"`.
+- The tray's "Cursor locked to PC" item shows and sets Deskflow's real state.
 - When no switch is sent (unlock/startup refused), `Sync-ScrollLockFromTV` derives it from the TV's real input (`getForegroundAppInfo`): OFF only if confirmed on HDMI1.
 - `Switch-ToHDMI1/2` return `$true` only if a command was sent; keep them free of other pipeline output.
 

@@ -23,6 +23,9 @@ $CliPath = "C:\Program Files\LGTV Companion\LGTVcli.exe"
 # Cap on the input-list query. It runs on the UI thread, so a hung CLI must not
 # be able to freeze the tray.
 $CliTimeoutMs = 2000
+# Deskflow writes every cursor-lock change here; it is the source of truth for
+# whether the cursor is locked (see Get-CursorLockState).
+$DeskflowLogFile = "C:\ProgramData\Deskflow\deskflow-daemon.log"
 # Ping budget per attempt. Kept small: this runs on the UI thread, and
 # Test-Connection against an unreachable TV blocks for ~9 seconds.
 $PingTimeoutMs = 400
@@ -280,24 +283,60 @@ function Test-HdmiInputAvailable([int]$Number) {
     return $true
 }
 
-# Scroll Lock drives Deskflow's "lock cursor to current screen":
-#   ON  while the TV shows this PC (HDMI2) - the cursor must not slide onto the
-#       Mac, which is not visible, taking keyboard input with it.
-#   OFF while the TV shows the Mac (HDMI1) - the cursor has to cross over.
-# Drives to a target state rather than blind-toggling. Windows drops injected
-# keys while the lock screen is up, so a change that does not take is left
-# pending and retried by $scrollLockTimer.
+# Is Deskflow's cursor currently locked to this PC? Read from Deskflow's own
+# log, NOT the Scroll Lock light: Deskflow flips its lock on every Scroll Lock
+# press it sees, independently of the light. A press seen by only one of them
+# (e.g. during the lock-screen transition) left the two permanently inverted -
+# the light said "off" while Deskflow kept the cursor locked to the PC.
+# Returns $null if Deskflow is not running or the log says nothing usable; the
+# caller then falls back to the light.
+function Get-CursorLockState {
+    if (-not (Get-Process -Name "deskflow-core" -ErrorAction SilentlyContinue)) { return $null }
+    try {
+        $fs = [System.IO.File]::Open($DeskflowLogFile, 'Open', 'Read', 'ReadWrite')
+        try {
+            $len = [Math]::Min($fs.Length, 65536)
+            [void]$fs.Seek(-$len, 'End')
+            $buf = New-Object byte[] $len
+            [void]$fs.Read($buf, 0, $len)
+        } finally { $fs.Close() }
+        $lines = [System.Text.Encoding]::UTF8.GetString($buf) -split "`n"
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            $line = $lines[$i]
+            if ($line -match 'cursor locked to current screen|scroll lock is on, locking cursor') { return $true }
+            if ($line -match 'cursor unlocked from current screen') { return $false }
+            # A restart starts unlocked unless "scroll lock is on" follows it,
+            # which the backwards scan would already have returned on.
+            if ($line -match 'NOTE: stopped server') { return $false }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-CursorLocked {
+    $state = Get-CursorLockState
+    if ($null -ne $state) { return $state }
+    return [System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll)
+}
+
+# Drives Deskflow's "lock cursor to current screen" (toggled by Scroll Lock):
+#   locked   while the TV shows this PC (HDMI2) - the cursor must not slide
+#            onto the Mac, which is not visible, taking keyboard input with it.
+#   unlocked while the TV shows the Mac (HDMI1) - the cursor has to cross over.
+# Presses Scroll Lock only when Deskflow is in the wrong state, then verifies
+# against Deskflow's log. A press Deskflow misses (Windows drops injected keys
+# around the lock screen) is left pending and retried by $scrollLockTimer.
 function Set-ScrollLock([bool]$On) {
     $script:ScrollLockTarget = $On
     $script:ScrollLockRetries = 0
-    if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -ne $On) {
+    if ((Test-CursorLocked) -ne $On) {
         [HotkeyManager]::ToggleScrollLock()
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 300
     }
-    if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -eq $On) {
+    if ((Test-CursorLocked) -eq $On) {
         $script:ScrollLockTarget = $null
     } else {
-        Write-TrayLog "  Scroll Lock change to $(if ($On) { 'ON' } else { 'OFF' }) did not take - retrying"
+        Write-TrayLog "  cursor lock change to $(if ($On) { 'locked' } else { 'unlocked' }) did not take - retrying"
     }
 }
 
@@ -437,13 +476,14 @@ function Switch-TVState {
 function Update-TrayStatus {
     $state = Get-TVState
     $activeLabel = if ($state -eq "1") { $script:Config.Hdmi1Label } else { $script:Config.Hdmi2Label }
-    $scrollLocked = [System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll)
+    # Deskflow's real cursor-lock state, not the Scroll Lock light (they can disagree).
+    $scrollLocked = Test-CursorLocked
     $notifyIcon.Text = "LG TV: {0} active (HDMI{1})" -f $activeLabel, $state
     $itemHdmi1.Text = "Switch to $($script:Config.Hdmi1Label) (HDMI 1)"
     $itemHdmi2.Text = "Switch to $($script:Config.Hdmi2Label) (HDMI 2)"
     $itemHdmi1.Checked = ($state -eq "1")
     $itemHdmi2.Checked = ($state -eq "2")
-    $itemScrollLock.Text = "Scroll Lock: $(if ($scrollLocked) { 'On' } else { 'Off' })"
+    $itemScrollLock.Text = "Cursor locked to PC: $(if ($scrollLocked) { 'On' } else { 'Off' })"
     $itemScrollLock.Checked = $scrollLocked
     if ($itemRequireCable) { $itemRequireCable.Checked = [bool]$script:Config.RequireCable }
 }
@@ -480,7 +520,9 @@ $contextMenu.Items.Add("-") | Out-Null # Separator
 
 $itemScrollLock = New-Object System.Windows.Forms.ToolStripMenuItem "Scroll Lock"
 $itemScrollLock.add_Click({
-    [HotkeyManager]::ToggleScrollLock()
+    # Sets Deskflow's lock to the opposite of its real state, rather than
+    # blind-toggling Scroll Lock (which inverts when the two disagree).
+    Set-ScrollLock (-not (Test-CursorLocked))
     Update-TrayStatus
 })
 $contextMenu.Items.Add($itemScrollLock) | Out-Null
@@ -607,22 +649,22 @@ $displaySettingsHandler = [EventHandler]{
 Write-TrayLog "--- tray app started (pid $PID) ---"
 if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
 
-# Retries a pending Scroll Lock change (see Set-ScrollLock) every 1.5 s for up
-# to a minute. Bounded so it never fights a manual Scroll Lock press for long;
+# Retries a pending cursor-lock change (see Set-ScrollLock) every 1.5 s for up
+# to 30 s. Bounded so it never fights a manual Scroll Lock press for long;
 # unlock re-syncs anyway.
 $scrollLockTimer = New-Object System.Windows.Forms.Timer
 $scrollLockTimer.Interval = 1500
 $scrollLockTimer.add_Tick({
     if ($null -eq $script:ScrollLockTarget) { return }
-    $want = if ($script:ScrollLockTarget) { "ON" } else { "OFF" }
-    if ([System.Windows.Forms.Control]::IsKeyLocked([System.Windows.Forms.Keys]::Scroll) -eq $script:ScrollLockTarget) {
-        Write-TrayLog "  Scroll Lock now $want after $($script:ScrollLockRetries) retries"
+    $want = if ($script:ScrollLockTarget) { "locked" } else { "unlocked" }
+    if ((Test-CursorLocked) -eq $script:ScrollLockTarget) {
+        Write-TrayLog "  cursor now $want after $($script:ScrollLockRetries) retries"
         $script:ScrollLockTarget = $null
         Update-TrayStatus
         return
     }
-    if ($script:ScrollLockRetries -ge 40) {
-        Write-TrayLog "  Scroll Lock still not $want after 40 retries - giving up until next unlock"
+    if ($script:ScrollLockRetries -ge 20) {
+        Write-TrayLog "  cursor still not $want after 20 retries - giving up until next unlock"
         $script:ScrollLockTarget = $null
         return
     }
