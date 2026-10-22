@@ -26,6 +26,7 @@ Git repo, remote `origin` = `git@github.com:Monarchinnovation2009/LG-TV.git`, br
 
 ### Switch gates (`Switch-ToHDMI1` / `Switch-ToHDMI2`), cheapest first
 
+0. Manual (non-`-Silent`) switches first call `Wake-TV`: a TV in standby does not answer ping, so if unreachable it sends LGTVcli `-powerOn` (Wake-on-LAN via Companion) and waits up to `$WakeTimeoutSeconds` (20) for it to answer, plus 4 s for HDMI to re-enumerate. Automatic triggers never wake the TV.
 1. `Test-SwitchAllowed` — if `RequireCable`, requires `Test-TVCableConnected` (an active LG/GSM monitor in WMI `WmiMonitorID`; EDID fields can be null, so decode via `Convert-EdidString`).
 2. `Test-TVConnected` — raw `System.Net.NetworkInformation.Ping` (400 ms × 2) to the TV IP read from `C:\ProgramData\LGTV Companion\config.json`. Never use `Test-Connection` here: it blocks the UI thread ~9 s when the TV is off.
 3. `Test-HdmiInputAvailable` — `LGTVcli.exe -request tv/getExternalInputList` (no `ssap://` prefix). Keys on `connected` only; `hdmiPlugIn` was measured to stay `true` with the cable out. Fails open on query error.

@@ -23,6 +23,8 @@ $CliPath = "C:\Program Files\LGTV Companion\LGTVcli.exe"
 # Cap on the input-list query. It runs on the UI thread, so a hung CLI must not
 # be able to freeze the tray.
 $CliTimeoutMs = 2000
+# How long a manual switch waits for a sleeping TV to come up after power on.
+$WakeTimeoutSeconds = 20
 # Deskflow writes every cursor-lock change here; it is the source of truth for
 # whether the cursor is locked (see Get-CursorLockState).
 $DeskflowLogFile = "C:\ProgramData\Deskflow\deskflow-daemon.log"
@@ -366,6 +368,30 @@ function Sync-ScrollLockFromTV {
     Update-TrayStatus
 }
 
+# A TV in standby does not answer ping, so the reachability gate alone would
+# refuse every switch while it sleeps. The old scripts sent the command blind
+# and LGTV Companion woke the TV (Wake-on-LAN). For explicit requests, do the
+# same: power it on, then wait until it answers. Returns $true once reachable.
+function Wake-TV {
+    if (Test-TVConnected) { return $true }
+    Write-TrayLog "  TV asleep - sending power on"
+    $notifyIcon.ShowBalloonTip(3000, "LG TV", "Waking the TV...", [System.Windows.Forms.ToolTipIcon]::Info)
+    Start-Process -FilePath $CliPath -ArgumentList "-powerOn" -WindowStyle Hidden
+    $deadline = (Get-Date).AddSeconds($WakeTimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-TVConnected) {
+            # Network comes up before HDMI/EDID; give Windows time to see the
+            # display again so the cable gate does not refuse.
+            Start-Sleep -Seconds 4
+            Write-TrayLog "  TV awake"
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-TrayLog "  TV did not wake within $WakeTimeoutSeconds s"
+    return $false
+}
+
 function Show-TVUnreachable {
     $notifyIcon.ShowBalloonTip(3000, "LG TV", "TV is not reachable - input unchanged.", [System.Windows.Forms.ToolTipIcon]::Info)
 }
@@ -392,6 +418,9 @@ function Show-InputEmpty($Label, $Number) {
 # target input has anything plugged into it.
 function Switch-ToHDMI1([switch]$Silent) {
     Write-TrayLog "Switch-ToHDMI1 requested (silent=$Silent)"
+    # Explicit requests wake a sleeping TV first; automatic (silent) ones never
+    # do - lock should leave the TV dark, and unlock must not turn it on.
+    if (-not $Silent) { [void](Wake-TV) }
     if (-not (Test-SwitchAllowed)) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
@@ -422,6 +451,9 @@ function Switch-ToHDMI1([switch]$Silent) {
 
 function Switch-ToHDMI2([switch]$Silent) {
     Write-TrayLog "Switch-ToHDMI2 requested (silent=$Silent)"
+    # Explicit requests wake a sleeping TV first; automatic (silent) ones never
+    # do - lock should leave the TV dark, and unlock must not turn it on.
+    if (-not $Silent) { [void](Wake-TV) }
     if (-not (Test-SwitchAllowed)) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
