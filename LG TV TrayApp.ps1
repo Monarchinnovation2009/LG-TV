@@ -109,7 +109,14 @@ function Write-TrayLog($Message) {
     try {
         "$(Get-Date -Format 'HH:mm:ss.fff') $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
     } catch {}
+    # Every logged action also becomes a notification (Settings > "Notify on
+    # every TV action"). Queued, not shown here: this runs on the SystemEvents
+    # thread for lock/unlock/cable events, and toasts fired a few ms apart
+    # replace each other. $scrollLockTimer shows the queue as one notice.
+    if ($script:Config -and $script:Config.NotifyAll) { $script:NoticeQueue.Enqueue($Message.Trim()) }
 }
+$script:NoticeQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+$script:NoticeBacklog = New-Object System.Collections.Generic.List[string]
 
 # State Management Helper
 function Get-TVState {
@@ -125,7 +132,7 @@ function Set-TVState($State) {
 function Get-Config {
     # RequireCable: only switch the TV while this PC is cabled to it. On by
     # default - switching a TV this PC is not plugged into is rarely wanted.
-    $default = @{ Hdmi1Label = "Mac"; Hdmi2Label = "PC"; RequireCable = $true }
+    $default = @{ Hdmi1Label = "Mac"; Hdmi2Label = "PC"; RequireCable = $true; NotifyAll = $true }
     if (Test-Path $ConfigFile) {
         try {
             $loaded = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
@@ -134,6 +141,7 @@ function Get-Config {
                 Hdmi2Label = if ($loaded.Hdmi2Label) { $loaded.Hdmi2Label } else { $default.Hdmi2Label }
                 # Absent from configs written before this option existed.
                 RequireCable = if ($null -ne $loaded.RequireCable) { [bool]$loaded.RequireCable } else { $default.RequireCable }
+                NotifyAll = if ($null -ne $loaded.NotifyAll) { [bool]$loaded.NotifyAll } else { $default.NotifyAll }
             }
         } catch { return $default }
     }
@@ -343,6 +351,7 @@ function Set-ScrollLock([bool]$On) {
     }
     if ((Test-CursorLocked) -eq $On) {
         $script:ScrollLockTarget = $null
+        Write-TrayLog "  -> cursor $(if ($On) { 'locked to PC' } else { 'unlocked' }) (Deskflow)"
     } else {
         Write-TrayLog "  cursor lock change to $(if ($On) { 'locked' } else { 'unlocked' }) did not take - retrying"
     }
@@ -375,7 +384,7 @@ function Sync-ScrollLockFromTV {
 function Wake-TV {
     if (Test-TVConnected) { return $true }
     Write-TrayLog "  TV asleep - sending power on"
-    $notifyIcon.ShowBalloonTip(3000, "LG TV", "Waking the TV...", [System.Windows.Forms.ToolTipIcon]::Info)
+    if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "Waking the TV...", [System.Windows.Forms.ToolTipIcon]::Info) }
     Start-Process -FilePath $CliPath -ArgumentList "-powerOn" -WindowStyle Hidden
     $deadline = (Get-Date).AddSeconds($WakeTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -393,7 +402,7 @@ function Wake-TV {
 }
 
 function Show-TVUnreachable {
-    $notifyIcon.ShowBalloonTip(3000, "LG TV", "TV is not reachable - input unchanged.", [System.Windows.Forms.ToolTipIcon]::Info)
+    if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "TV is not reachable - input unchanged.", [System.Windows.Forms.ToolTipIcon]::Info) }
 }
 
 # Central policy gate for every switch, manual or automatic. Checked before the
@@ -404,11 +413,11 @@ function Test-SwitchAllowed {
 }
 
 function Show-NoCable {
-    $notifyIcon.ShowBalloonTip(3000, "LG TV", "This PC is not connected to the TV by cable - input unchanged. Settings > 'Only switch when TV cable is connected' turns this off.", [System.Windows.Forms.ToolTipIcon]::Info)
+    if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "This PC is not connected to the TV by cable - input unchanged. Settings > 'Only switch when TV cable is connected' turns this off.", [System.Windows.Forms.ToolTipIcon]::Info) }
 }
 
 function Show-InputEmpty($Label, $Number) {
-    $notifyIcon.ShowBalloonTip(3000, "LG TV", "Nothing is plugged into HDMI $Number ($Label) - input unchanged.", [System.Windows.Forms.ToolTipIcon]::Warning)
+    if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "Nothing is plugged into HDMI $Number ($Label) - input unchanged.", [System.Windows.Forms.ToolTipIcon]::Warning) }
 }
 
 # TV Action Functions
@@ -420,7 +429,10 @@ function Switch-ToHDMI1([switch]$Silent) {
     Write-TrayLog "Switch-ToHDMI1 requested (silent=$Silent)"
     # Explicit requests wake a sleeping TV first; automatic (silent) ones never
     # do - lock should leave the TV dark, and unlock must not turn it on.
-    if (-not $Silent) { [void](Wake-TV) }
+    if (-not $Silent) {
+        Write-TrayLog "rule: manual switch -> wake TV if asleep; needs cable (if setting on), TV reachable, device on target input"
+        [void](Wake-TV)
+    }
     if (-not (Test-SwitchAllowed)) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
@@ -440,7 +452,8 @@ function Switch-ToHDMI1([switch]$Silent) {
         return $false
     }
     Show-TVScreen
-    Write-TrayLog "  sending -sethdmi1"
+    Write-TrayLog "  -> TV to HDMI1 ($($script:Config.Hdmi1Label))"
+    Write-TrayLog "rule: TV shows Mac -> cursor unlocked so it can cross to the Mac"
     Start-Process $LgtvPath -ArgumentList "-sethdmi1" -WindowStyle Hidden
     Set-TVState "1"
     Start-Sleep -Seconds 1
@@ -453,7 +466,10 @@ function Switch-ToHDMI2([switch]$Silent) {
     Write-TrayLog "Switch-ToHDMI2 requested (silent=$Silent)"
     # Explicit requests wake a sleeping TV first; automatic (silent) ones never
     # do - lock should leave the TV dark, and unlock must not turn it on.
-    if (-not $Silent) { [void](Wake-TV) }
+    if (-not $Silent) {
+        Write-TrayLog "rule: manual switch -> wake TV if asleep; needs cable (if setting on), TV reachable, device on target input"
+        [void](Wake-TV)
+    }
     if (-not (Test-SwitchAllowed)) {
         Write-TrayLog "  refused: this PC is not cabled to the TV (RequireCable on)"
         if (-not $Silent) { Show-NoCable }
@@ -473,7 +489,8 @@ function Switch-ToHDMI2([switch]$Silent) {
         return $false
     }
     Show-TVScreen
-    Write-TrayLog "  sending -sethdmi2"
+    Write-TrayLog "  -> TV to HDMI2 ($($script:Config.Hdmi2Label))"
+    Write-TrayLog "rule: TV shows PC -> cursor locked to PC so it can't drift to the hidden Mac"
     Start-Process $LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
     Set-TVState "2"
     Set-ScrollLock $true
@@ -629,6 +646,16 @@ $itemRequireCable.add_Click({
 })
 $settingsMenu.DropDownItems.Add($itemRequireCable) | Out-Null
 
+$itemNotifyAll = New-Object System.Windows.Forms.ToolStripMenuItem "Notify on every TV action"
+$itemNotifyAll.CheckOnClick = $true
+$itemNotifyAll.Checked = [bool]$script:Config.NotifyAll
+$itemNotifyAll.ToolTipText = "Show a notification for each action, with the rule that was applied. Everything is also written to tray_debug.txt."
+$itemNotifyAll.add_Click({
+    $script:Config.NotifyAll = $itemNotifyAll.Checked
+    Save-Config $script:Config
+})
+$settingsMenu.DropDownItems.Add($itemNotifyAll) | Out-Null
+
 $settingsMenu.DropDownItems.Add("-") | Out-Null # Separator
 
 $itemStartup = New-Object System.Windows.Forms.ToolStripMenuItem "Start with Windows"
@@ -680,7 +707,8 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
     if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
         # Locking: nothing should show on the TV - not the Mac, not the lock
         # screen. Blank the panel (see Hide-TVScreen).
-        Write-TrayLog "event: session locked"
+        Write-TrayLog "event: PC locked"
+        Write-TrayLog "rule: lock -> TV to PC input, then screen off (only if PC cabled to TV)"
         # Only when this PC is actually on the TV (honours RequireCable).
         # Uncabled, the TV is showing something else and is not ours to touch.
         if (Test-SwitchAllowed) {
@@ -689,7 +717,8 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
             Write-TrayLog "  skipped: this PC is not cabled to the TV"
         }
     } elseif ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionUnlock) {
-        Write-TrayLog "event: session unlocked"
+        Write-TrayLog "event: PC unlocked"
+        Write-TrayLog "rule: unlock -> screen on if dark; TV to PC (HDMI2) if cabled; never wakes a sleeping TV"
         # Light the panel first, regardless of the cable gate: if we blanked it,
         # we must not leave it dark.
         Show-TVScreen -CheckTV
@@ -711,6 +740,8 @@ $displaySettingsHandler = [EventHandler]{
     $nowConnected = Test-TVCableConnected
     if ($script:LastCableState -ne $nowConnected) {
         Write-TrayLog "event: TV cable $(if ($nowConnected) { 'connected' } else { 'disconnected' })"
+        if (-not $nowConnected) { Write-TrayLog "rule: cable unplugged -> TV to HDMI2 (dead input) so nothing shows" }
+        else { Write-TrayLog "rule: cable plugged in -> no action" }
     }
     if ($script:LastCableState -and -not $nowConnected) {
         Hide-TVContent
@@ -725,8 +756,32 @@ $displaySettingsHandler = [EventHandler]{
 # check. Cable-gated: if this PC is not plugged into the TV, leave the TV alone.
 # Remove this line if you would rather nothing switched at startup.
 Write-TrayLog "--- tray app started (pid $PID) ---"
+Write-TrayLog "rule: app start -> screen on if dark; TV to PC (HDMI2) if cabled"
 Show-TVScreen -CheckTV
 if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
+
+# Shows queued action notices as one notification. Text is capped at 255
+# chars by Windows, so a long sequence is split and the rest shown on the next
+# ticks.
+function Show-QueuedNotices {
+    $line = $null
+    $lines = New-Object System.Collections.Generic.List[string]
+    while ($script:NoticeQueue.TryDequeue([ref]$line)) { $lines.Add($line) }
+    if ($lines.Count -gt 0) {
+        $chunk = ""
+        foreach ($l in $lines) {
+            if ($l.Length -gt 240) { $l = $l.Substring(0, 237) + "..." }
+            if (($chunk.Length + $l.Length + 1) -gt 250) { $script:NoticeBacklog.Add($chunk); $chunk = "" }
+            $chunk = if ($chunk) { "$chunk`n$l" } else { $l }
+        }
+        if ($chunk) { $script:NoticeBacklog.Add($chunk) }
+    }
+    if ($script:NoticeBacklog.Count -gt 0) {
+        $text = $script:NoticeBacklog[0]
+        $script:NoticeBacklog.RemoveAt(0)
+        $notifyIcon.ShowBalloonTip(5000, "LG TV", $text, [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+}
 
 # Retries a pending cursor-lock change (see Set-ScrollLock) every 1.5 s for up
 # to 30 s. Bounded so it never fights a manual Scroll Lock press for long;
@@ -734,6 +789,7 @@ if (-not (Switch-ToHDMI2 -Silent)) { Sync-ScrollLockFromTV }
 $scrollLockTimer = New-Object System.Windows.Forms.Timer
 $scrollLockTimer.Interval = 1500
 $scrollLockTimer.add_Tick({
+    Show-QueuedNotices
     if ($null -eq $script:ScrollLockTarget) { return }
     $want = if ($script:ScrollLockTarget) { "locked" } else { "unlocked" }
     if ((Test-CursorLocked) -eq $script:ScrollLockTarget) {

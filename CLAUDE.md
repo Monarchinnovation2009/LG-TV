@@ -17,6 +17,7 @@ Git repo, remote `origin` = `git@github.com:Monarchinnovation2009/LG-TV.git`, br
 - The VBS files are silent launchers for the matching `.ps1`. Edit the `.ps1`, not the `.vbs`.
 - `Script for task scedular of PowerShell.txt` is a one-off setup/cleanup script: it regenerates `LG TV Toggle.vbs` and **unregisters** the obsolete `LGTV_Switch_On_Lock` task. It no longer registers a task or embeds toggle logic.
 - `tray_debug.txt` (gitignored) is a decision log: every switch request, which gate refused it, and session/cable events. Read it first when a behaviour report comes in.
+- Every `Write-TrayLog` line is also a Windows notification when `NotifyAll` is on (config default `true`, Settings → "Notify on every TV action"). Lines are queued (`$script:NoticeQueue`) and shown by `$scrollLockTimer` on the UI thread as one notice per 1.5 s, split at Windows' 255-char limit. Each trigger logs a `rule:` line stating the rule applied, so the user can check behaviour against intent — keep those lines accurate when changing a rule.
 - State file `$env:TEMP\lgtv_state.txt`: `"1"` = HDMI1 (Mac), `"2"` = HDMI2 (PC). It is a cache, not truth — the TV's real input is `LGTVcli.exe -request com.webos.applicationManager/getForegroundAppInfo`.
 
 ## Architecture
