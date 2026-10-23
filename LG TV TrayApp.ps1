@@ -158,6 +158,9 @@ $script:Config = Get-Config
 # Pending Scroll Lock change, retried by $scrollLockTimer (see Set-ScrollLock).
 $script:ScrollLockTarget = $null
 $script:ScrollLockRetries = 0
+$script:LastScrollPress = [DateTime]::MinValue
+# Seconds to wait for Deskflow to log a Scroll Lock press before pressing again.
+$ScrollPressSettleSeconds = 5
 # Set while Hide-TVScreen has the TV panel blanked.
 $script:ScreenBlanked = $false
 
@@ -260,12 +263,12 @@ function Invoke-TVRequest($Endpoint) { return (Invoke-TVCli @("-request", $Endpo
 
 # Runs LGTVcli with the given arguments and returns its parsed JSON output, or
 # $null on failure or timeout.
-function Invoke-TVCli([string[]]$Arguments) {
+function Invoke-TVCli([string[]]$Arguments, [int]$TimeoutMs = $CliTimeoutMs) {
     $out = [System.IO.Path]::GetTempFileName()
     try {
         $proc = Start-Process -FilePath $CliPath -ArgumentList $Arguments `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput $out
-        if (-not $proc.WaitForExit($CliTimeoutMs)) {
+        if (-not $proc.WaitForExit($TimeoutMs)) {
             try { $proc.Kill() } catch {}
             return $null
         }
@@ -347,6 +350,7 @@ function Set-ScrollLock([bool]$On) {
     $script:ScrollLockRetries = 0
     if ((Test-CursorLocked) -ne $On) {
         [HotkeyManager]::ToggleScrollLock()
+        $script:LastScrollPress = Get-Date
         Start-Sleep -Milliseconds 300
     }
     if ((Test-CursorLocked) -eq $On) {
@@ -534,9 +538,21 @@ function Hide-TVScreen {
     Hide-TVContent
     # Give the input switch a moment so it does not wake the panel again.
     Start-Sleep -Milliseconds 1500
-    $state = Get-TVPowerState (Invoke-TVCli @("-screenOff"))
+    # Right after an input change the TV can take over 2 s to answer, which
+    # left every lock logging an empty, unconfirmed reply. Wait longer, then
+    # check the real power state and send once more if the panel is still lit.
     $script:ScreenBlanked = $true
-    Write-TrayLog "  screen off sent, TV reports '$state'"
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        [void](Invoke-TVCli @("-screenOff") 6000)
+        $state = Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")
+        if ($state -eq "Screen Off") {
+            Write-TrayLog "  -> screen off (confirmed by TV)"
+            return
+        }
+        Write-TrayLog "  screen off attempt $attempt not confirmed - TV reports '$state'"
+        Start-Sleep -Milliseconds 1500
+    }
+    Write-TrayLog "  -> screen may still be ON (TV did not confirm screen off)"
 }
 
 # Undoes Hide-TVScreen. Also checks the TV itself when -CheckTV is given, so a
@@ -783,8 +799,8 @@ function Show-QueuedNotices {
     }
 }
 
-# Retries a pending cursor-lock change (see Set-ScrollLock) every 1.5 s for up
-# to 30 s. Bounded so it never fights a manual Scroll Lock press for long;
+# Retries a pending cursor-lock change (see Set-ScrollLock): checks every 1.5 s,
+# presses again at most every $ScrollPressSettleSeconds s, up to 6 times. Bounded so it never fights a manual Scroll Lock press for long;
 # unlock re-syncs anyway.
 $scrollLockTimer = New-Object System.Windows.Forms.Timer
 $scrollLockTimer.Interval = 1500
@@ -798,13 +814,19 @@ $scrollLockTimer.add_Tick({
         Update-TrayStatus
         return
     }
-    if ($script:ScrollLockRetries -ge 20) {
-        Write-TrayLog "  cursor still not $want after 20 retries - giving up until next unlock"
+    if ($script:ScrollLockRetries -ge 6) {
+        Write-TrayLog "  cursor still not $want after 6 retries - giving up until next unlock"
         $script:ScrollLockTarget = $null
         return
     }
+    # Deskflow can take ~3 s to process a press around the lock screen; a
+    # retry fired before it lands overshoots (locked -> unlocked -> locked was
+    # seen in the log). Only press again once the last press has had time to
+    # show up in Deskflow's log.
+    if (((Get-Date) - $script:LastScrollPress).TotalSeconds -lt $ScrollPressSettleSeconds) { return }
     $script:ScrollLockRetries++
     [HotkeyManager]::ToggleScrollLock()
+    $script:LastScrollPress = Get-Date
 })
 $scrollLockTimer.Start()
 
