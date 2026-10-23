@@ -430,27 +430,45 @@ function Sync-ScrollLockFromTV {
     Update-TrayStatus
 }
 
-# A TV in standby does not answer ping, so the reachability gate alone would
-# refuse every switch while it sleeps. The old scripts sent the command blind
-# and LGTV Companion woke the TV (Wake-on-LAN). For explicit requests, do the
-# same: power it on, then wait until it answers. Returns $true once reachable.
+# Makes sure the TV panel is actually ON before an explicit switch. Answering
+# ping is NOT enough: in "Active Standby" the TV is off but its network stays
+# up, so a reachability-only check sent the input switch to a dark TV. Asks
+# the TV for its power state instead:
+#   Active          -> nothing to do
+#   Screen Off      -> -screenOn (we blanked it on lock)
+#   anything else   -> -powerOn (Active Standby, Suspend, ...)
+#   not answering   -> deep standby: -powerOn (Wake-on-LAN via Companion)
+# then waits until the TV reports Active. Returns $true once it does.
 function Wake-TV {
-    if (Test-TVConnected) { return $true }
-    Write-TrayLog "  TV asleep - sending power on"
-    if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "Waking the TV...", [System.Windows.Forms.ToolTipIcon]::Info) }
-    Start-Process -FilePath $CliPath -ArgumentList "-powerOn" -WindowStyle Hidden
+    $state = $null
+    if (Test-TVConnected) {
+        $state = Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")
+        # Unknown state: don't block the switch on a failed query.
+        if ($null -eq $state -or $state -eq "Active") { return $true }
+    }
+    $shown = if ($state) { $state } else { "not answering (deep standby)" }
+    if ($state -eq "Screen Off") {
+        Write-TrayLog "  TV screen is off - sending screen on"
+        [void](Invoke-TVCli @("-screenOn") 6000)
+        $script:ScreenBlanked = $false
+    } else {
+        Write-TrayLog "  TV is off ($shown) - sending power on"
+        if (-not $script:Config.NotifyAll) { $notifyIcon.ShowBalloonTip(3000, "LG TV", "Waking the TV...", [System.Windows.Forms.ToolTipIcon]::Info) }
+        Start-Process -FilePath $CliPath -ArgumentList "-powerOn" -WindowStyle Hidden
+    }
     $deadline = (Get-Date).AddSeconds($WakeTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        if (Test-TVConnected) {
-            # Network comes up before HDMI/EDID; give Windows time to see the
-            # display again so the cable gate does not refuse.
+        Start-Sleep -Milliseconds 700
+        if (-not (Test-TVConnected)) { continue }
+        if ((Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")) -eq "Active") {
+            # Network and panel come up before HDMI/EDID; give Windows time to
+            # see the display again so the cable gate does not refuse.
             Start-Sleep -Seconds 4
-            Write-TrayLog "  TV awake"
+            Write-TrayLog "  -> TV on (confirmed by TV)"
             return $true
         }
-        Start-Sleep -Milliseconds 500
     }
-    Write-TrayLog "  TV did not wake within $WakeTimeoutSeconds s"
+    Write-TrayLog "  TV did not turn on within $WakeTimeoutSeconds s"
     return $false
 }
 
