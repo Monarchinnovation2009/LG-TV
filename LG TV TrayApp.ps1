@@ -28,6 +28,12 @@ $WakeTimeoutSeconds = 20
 # Deskflow writes every cursor-lock change here; it is the source of truth for
 # whether the cursor is locked (see Get-CursorLockState).
 $DeskflowLogFile = "C:\ProgramData\Deskflow\deskflow-daemon.log"
+# This PC's Deskflow screen name (the server); the Mac is any other screen.
+$DeskflowServerName = $env:COMPUTERNAME
+try {
+    $nameLine = Get-Content "$env:APPDATA\Deskflow\Deskflow.conf" -ErrorAction Stop | Where-Object { $_ -match '^computerName=(.+)$' } | Select-Object -First 1
+    if ($nameLine -match '^computerName=(.+)$') { $DeskflowServerName = $Matches[1].Trim() }
+} catch {}
 # Ping budget per attempt. Kept small: this runs on the UI thread, and
 # Test-Connection against an unreachable TV blocks for ~9 seconds.
 $PingTimeoutMs = 400
@@ -159,6 +165,7 @@ $script:Config = Get-Config
 $script:ScrollLockTarget = $null
 $script:ScrollLockRetries = 0
 $script:LastScrollPress = [DateTime]::MinValue
+$script:LockDeferred = $false
 # Seconds to wait for Deskflow to log a Scroll Lock press before pressing again.
 $ScrollPressSettleSeconds = 5
 # Set while Hide-TVScreen has the TV panel blanked.
@@ -332,6 +339,32 @@ function Get-CursorLockState {
     return $null
 }
 
+# Which Deskflow screen is the cursor on? From the last "switch from X to Y"
+# in Deskflow's log; a server restart puts it back on this PC. $null if unknown.
+function Get-CursorScreen {
+    try {
+        $fs = [System.IO.File]::Open($DeskflowLogFile, 'Open', 'Read', 'ReadWrite')
+        try {
+            $len = [Math]::Min($fs.Length, 262144)
+            [void]$fs.Seek(-$len, 'End')
+            $buf = New-Object byte[] $len
+            [void]$fs.Read($buf, 0, $len)
+        } finally { $fs.Close() }
+        $lines = [System.Text.Encoding]::UTF8.GetString($buf) -split "`n"
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            if ($lines[$i] -match 'switch from ".*" to "(.*)" at') { return $Matches[1] }
+            if ($lines[$i] -match 'NOTE: stopped server') { return $DeskflowServerName }
+        }
+    } catch {}
+    return $null
+}
+
+# Unknown counts as on the PC, so a missing log never blocks the lock.
+function Test-CursorOnPC {
+    $screen = Get-CursorScreen
+    return ($null -eq $screen -or $screen -eq $DeskflowServerName)
+}
+
 function Test-CursorLocked {
     $state = Get-CursorLockState
     if ($null -ne $state) { return $state }
@@ -348,6 +381,22 @@ function Test-CursorLocked {
 function Set-ScrollLock([bool]$On) {
     $script:ScrollLockTarget = $On
     $script:ScrollLockRetries = 0
+    $script:LockDeferred = $false
+    # Deskflow's lock means "lock to the CURRENT screen". Locking while the
+    # cursor is on the Mac trapped keyboard and mouse there for an hour while
+    # the TV showed the PC. The app cannot pull the cursor back (Deskflow
+    # ignores injected mouse moves while on the Mac), so instead make sure the
+    # cursor is free, and let $scrollLockTimer lock it once it is back on the PC.
+    if ($On -and -not (Test-CursorOnPC)) {
+        $script:LockDeferred = $true
+        Write-TrayLog "rule: cursor is on the Mac -> lock deferred; cursor left free so you can move it back to the PC"
+        if (Test-CursorLocked) {
+            [HotkeyManager]::ToggleScrollLock()
+            $script:LastScrollPress = Get-Date
+            Write-TrayLog "  -> cursor unlocked so it can come back"
+        }
+        return
+    }
     if ((Test-CursorLocked) -ne $On) {
         [HotkeyManager]::ToggleScrollLock()
         $script:LastScrollPress = Get-Date
@@ -807,6 +856,20 @@ $scrollLockTimer.Interval = 1500
 $scrollLockTimer.add_Tick({
     Show-QueuedNotices
     if ($null -eq $script:ScrollLockTarget) { return }
+    if ($script:ScrollLockTarget -and -not (Test-CursorOnPC)) {
+        # Still on the Mac: keep it free (a lock now would trap it there).
+        if ((Test-CursorLocked) -and ((Get-Date) - $script:LastScrollPress).TotalSeconds -ge $ScrollPressSettleSeconds) {
+            [HotkeyManager]::ToggleScrollLock()
+            $script:LastScrollPress = Get-Date
+        }
+        return
+    }
+    if ($script:LockDeferred) {
+        $script:LockDeferred = $false
+        Write-TrayLog "  cursor back on the PC - locking it there now"
+        Set-ScrollLock $true
+        return
+    }
     $want = if ($script:ScrollLockTarget) { "locked" } else { "unlocked" }
     if ((Test-CursorLocked) -eq $script:ScrollLockTarget) {
         Write-TrayLog "  cursor now $want after $($script:ScrollLockRetries) retries"
