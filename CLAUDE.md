@@ -55,3 +55,5 @@ The PC is the Deskflow server (layout: PC left, Mac mini right). Deskflow treats
 - `Hide-TVContent` deliberately bypasses the cable and input gates (a dead input is the goal); it still requires reachability.
 
 LGTV Companion's own `SetHdmiInput` is set to `false` in its config, because it switched to HDMI2 on resume with no cable check; the tray app replaces it.
+
+Companion's `AdhereDisplayTopology` is set to `true` (backup `config.json.bak-before-topology`): Companion powers the TV off/on with the PC's sleep/wake, and without this it did so even with the cable unplugged — the TV was seen powering on 3 s after the PC woke with no tray-app command, and such power cycling ends an iPad's wireless cast. The config file is writable by the user and `Restart-Service LGTVsvc` works without elevation. Separately, the TV itself went to `Active Standby` ~2 min after being left on the dead HDMI2 input (forced by `Hide-TVContent` on cable unplug) — probably its own no-signal auto-off; not yet confirmed or addressed.
