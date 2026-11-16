@@ -642,6 +642,7 @@ function Hide-TVScreen {
     $other = Get-TVOtherContent
     if ($other) {
         Write-TrayLog "rule: TV is showing something else ($other) -> screen left on, TV left alone"
+        $script:OtherContentAtLock = $other
         return
     }
     Hide-TVContent
@@ -846,6 +847,24 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
         Write-TrayLog "rule: unlock -> screen on if dark; TV to PC (HDMI2) if cabled; never wakes a sleeping TV"
         # Light the panel first, regardless of the cable gate: if we blanked it,
         # we must not leave it dark.
+        # The TV was someone else's (e.g. an iPad casting) when we locked. Do
+        # not take it back automatically, whatever it reports now: on unlock
+        # the TV once no longer reported the cast (or did not answer) and the
+        # automatic switch to HDMI2 ended the iPad's projection. The user
+        # switches by hand when they want the TV. Log what the TV shows now,
+        # so a cast that died while the PC slept can be told apart.
+        if ($script:OtherContentAtLock) {
+            $was = $script:OtherContentAtLock
+            $script:OtherContentAtLock = $null
+            $nowApp = "no answer"
+            $resp = Invoke-TVRequest "com.webos.applicationManager/getForegroundAppInfo"
+            if ($resp) { $nowApp = "$(foreach ($device in $resp.PSObject.Properties) { $device.Value.payload.appId })" }
+            $nowPower = Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")
+            Write-TrayLog "rule: TV was showing something else ($was) at lock -> no automatic switch on unlock, TV left alone"
+            Write-TrayLog "  TV now: app='$nowApp' power='$nowPower'"
+            Sync-ScrollLockFromTV
+            return
+        }
         Show-TVScreen -CheckTV
         # Coming back - take the TV to this PC. This replaces LGTV Companion's
         # own unconditional SetHdmiInput-on-resume, which had no cable check.
@@ -860,6 +879,7 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
 # changes, DPI changes and monitor rearrangement, so act only on a real
 # connected -> disconnected transition rather than on every event.
 $script:LastCableState = Test-TVCableConnected
+$script:OtherContentAtLock = $null
 $displaySettingsHandler = [EventHandler]{
     param($sender, $e)
     $nowConnected = Test-TVCableConnected
