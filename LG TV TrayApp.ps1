@@ -516,6 +516,14 @@ function Switch-ToHDMI1([switch]$Silent) {
         Update-TrayStatus
         return $false
     }
+    if ($Silent) {
+        $other = Get-TVOtherContent
+        if ($other) {
+            Write-TrayLog "rule: TV is showing something else ($other) -> automatic switch skipped, TV left alone"
+            Update-TrayStatus
+            return $false
+        }
+    }
     if (-not (Test-HdmiInputAvailable 1)) {
         Write-TrayLog "  refused: TV reports nothing plugged into HDMI1"
         if (-not $Silent) { Show-InputEmpty $script:Config.Hdmi1Label 1 }
@@ -553,6 +561,14 @@ function Switch-ToHDMI2([switch]$Silent) {
         Update-TrayStatus
         return $false
     }
+    if ($Silent) {
+        $other = Get-TVOtherContent
+        if ($other) {
+            Write-TrayLog "rule: TV is showing something else ($other) -> automatic switch skipped, TV left alone"
+            Update-TrayStatus
+            return $false
+        }
+    }
     if (-not (Test-HdmiInputAvailable 2)) {
         Write-TrayLog "  refused: TV reports nothing plugged into HDMI2"
         if (-not $Silent) { Show-InputEmpty $script:Config.Hdmi2Label 2 }
@@ -569,6 +585,22 @@ function Switch-ToHDMI2([switch]$Silent) {
     return $true
 }
 
+# Is the TV showing something that is not ours? "Ours" is HDMI1 (Mac), HDMI2
+# (PC), the home screen or nothing. Anything else - an iPad casting over
+# AirPlay, another HDMI port, a TV app - belongs to whoever is using the TV,
+# and automatic actions (lock, unlock, startup, cable unplug) must not take it
+# away: an unlock once pulled the TV to the PC in the middle of an iPad
+# projection. Returns that app's id, or $null if the TV is ours or the query
+# failed (so a failed query never blocks anything). Manual switches skip this.
+function Get-TVOtherContent {
+    $resp = Invoke-TVRequest "com.webos.applicationManager/getForegroundAppInfo"
+    if (-not $resp) { return $null }
+    $appId = foreach ($device in $resp.PSObject.Properties) { $device.Value.payload.appId }
+    $appId = "$appId"
+    if ($appId -eq "" -or $appId -in @("com.webos.app.hdmi1", "com.webos.app.hdmi2", "com.webos.app.home")) { return $null }
+    return $appId
+}
+
 # Privacy action for lock / cable-disconnect: point the TV at this PC's input so
 # whatever was on the other input stops being visible. With the cable out that
 # input is dead, which is the desired outcome - "show nothing" rather than "show
@@ -583,6 +615,11 @@ function Hide-TVContent {
     Write-TrayLog "Hide-TVContent (lock or cable disconnect) - forcing HDMI2, gates bypassed"
     if (-not (Test-TVConnected)) {
         Write-TrayLog "  refused: TV not reachable on the network"
+        return
+    }
+    $other = Get-TVOtherContent
+    if ($other) {
+        Write-TrayLog "rule: TV is showing something else ($other) -> not hidden, TV left alone"
         return
     }
     Start-Process $LgtvPath -ArgumentList "-sethdmi2" -WindowStyle Hidden
@@ -602,6 +639,11 @@ function Hide-TVScreen {
         Write-TrayLog "  refused: TV not reachable on the network"
         return
     }
+    $other = Get-TVOtherContent
+    if ($other) {
+        Write-TrayLog "rule: TV is showing something else ($other) -> screen left on, TV left alone"
+        return
+    }
     Hide-TVContent
     # Give the input switch a moment so it does not wake the panel again.
     Start-Sleep -Milliseconds 1500
@@ -612,8 +654,8 @@ function Hide-TVScreen {
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         [void](Invoke-TVCli @("-screenOff") 6000)
         $state = Get-TVPowerState (Invoke-TVRequest "com.webos.service.tvpower/power/getPowerState")
-        if ($state -eq "Screen Off") {
-            Write-TrayLog "  -> screen off (confirmed by TV)"
+        if ($state -and $state -ne "Active") {
+            Write-TrayLog "  -> screen off (TV reports '$state')"
             return
         }
         Write-TrayLog "  screen off attempt $attempt not confirmed - TV reports '$state'"

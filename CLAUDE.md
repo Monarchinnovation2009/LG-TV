@@ -47,6 +47,7 @@ The PC is the Deskflow server (layout: PC left, Mac mini right). Deskflow treats
 
 ### Automatic triggers
 
+- **Automatic triggers never take the TV from someone else's content.** `Get-TVOtherContent` returns the TV's foreground app id unless it is HDMI1, HDMI2, the home screen or empty. If it returns one (iPad over AirPlay, another HDMI port, a TV app), silent switches, `Hide-TVContent` and `Hide-TVScreen` all skip and log a `rule:` line. Manual switches ignore it. Fails open on query error.
 - **Lock** → `Hide-TVScreen`: `Hide-TVContent` (HDMI2, cursor locked to PC) then LGTVcli `-screenOff`, so nothing at all shows — HDMI2 alone still shows the Windows lock screen. Only when `Test-SwitchAllowed`. Sets `$script:ScreenBlanked`.
 - **Cable disconnect** (`DisplaySettingsChanged`, acting only on a connected→disconnected transition) → `Hide-TVContent`.
 - **Unlock** and **startup** → `Show-TVScreen -CheckTV` (`-screenOn` if we blanked it or the TV reports `Screen Off`, regardless of the cable gate), then `Switch-ToHDMI2 -Silent`; if refused, `Sync-ScrollLockFromTV`. Manual switches also call `Show-TVScreen`.
